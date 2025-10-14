@@ -1,2 +1,0 @@
-# Senior_Engineering_Design_Project
-mian repository
