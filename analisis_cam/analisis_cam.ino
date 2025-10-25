@@ -4,8 +4,10 @@ P1= x:20.0 ,y:0.0
 P2= x:200.0 ,y:0.0
 P3= x:200.0 ,y:130.0
 P4= x:20.0, y:130.0
-p5= x:20.0, y:265.0
-p6= x:200.0, y:265.0*/
+P5= x:20.0, y:265.0
+P6= x:200.0, y:265.0
+*/
+
 // ===== Pines EJE X =====
 #define X_STEP_PIN     18
 #define X_DIR_PIN      19
@@ -67,6 +69,12 @@ bool fan_on = false;
 inline long mmToStepsX(float mm) { return (long)round(mm * X_STEPS_PER_MM); }
 inline long mmToStepsY(float mm) { return (long)round(mm * Y_STEPS_PER_MM); }
 
+inline float stepsToMmX(long steps) { return (float)steps / X_STEPS_PER_MM; }
+inline float stepsToMmY(long steps) { return (float)steps / Y_STEPS_PER_MM; }
+
+inline float getXmm() { return stepsToMmX(stepperX->getCurrentPosition()); }
+inline float getYmm() { return stepsToMmY(stepperY->getCurrentPosition()); }
+
 inline bool endstopXPressed() {
   int v = digitalRead(X_ENDSTOP_PIN);
   return X_ENDSTOP_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
@@ -88,7 +96,6 @@ void fanWrite(bool on) {
   else
     digitalWrite(FAN_PIN, on ? LOW : HIGH);
 }
-
 void fanOn()  { fanWrite(true);  }
 void fanOff() { fanWrite(false); }
 
@@ -165,24 +172,6 @@ void homeY() {
   if (!Y_HOMED) Serial.println(F("⚠️ Y: Homing fallido"));
 }
 
-// ===== Ir a cero =====
-void goToZeroX() {
-  if (!X_HOMED) { Serial.println(F("⚠️ Primero 'homex'")); return; }
-  long delta = 0 - stepperX->getCurrentPosition();
-  Serial.println(F("→ X a 0..."));
-  stepperX->move(delta);
-  waitUntilStop(stepperX);
-  Serial.println(F("OK X=0"));
-}
-void goToZeroY() {
-  if (!Y_HOMED) { Serial.println(F("⚠️ Primero 'homey'")); return; }
-  long delta = 0 - stepperY->getCurrentPosition();
-  Serial.println(F("→ Y a 0..."));
-  stepperY->move(delta);
-  waitUntilStop(stepperY);
-  Serial.println(F("OK Y=0"));
-}
-
 // ==================== Lógica de Límites ====================
 bool checkLimitX(float mmTarget) {
   if (!X_HOMED) return true; // antes del homing, no limitar
@@ -193,7 +182,6 @@ bool checkLimitX(float mmTarget) {
   }
   return true;
 }
-
 bool checkLimitY(float mmTarget) {
   if (!Y_HOMED) return true;
   if (mmTarget < 0 || mmTarget > Y_MAX_MM) {
@@ -204,17 +192,97 @@ bool checkLimitY(float mmTarget) {
   return true;
 }
 
+// ==================== Movimiento absoluto (por ejes) ====================
+bool moveToXAbs(float x_mm) {
+  if (!checkLimitX(x_mm)) return false;
+  float cur = getXmm();
+  float delta = x_mm - cur;
+  long st = mmToStepsX(delta);
+  if (st == 0) return true;
+  Serial.print(F("→ X a ")); Serial.print(x_mm, 2); Serial.println(F(" mm (abs)"));
+  stepperX->move(st);
+  waitUntilStop(stepperX);
+  return true;
+}
+bool moveToYAbs(float y_mm) {
+  if (!checkLimitY(y_mm)) return false;
+  float cur = getYmm();
+  float delta = y_mm - cur;
+  long st = mmToStepsY(delta);
+  if (st == 0) return true;
+  Serial.print(F("→ Y a ")); Serial.print(y_mm, 2); Serial.println(F(" mm (abs)"));
+  stepperY->move(st);
+  waitUntilStop(stepperY);
+  return true;
+}
+
+// Mover a XY absolutos (secuencial X luego Y). Si prefieres Y primero, invierte el orden.
+bool moveToXYAbs(float x_mm, float y_mm) {
+  // Verifica límites antes de mover
+  if (!checkLimitX(x_mm) || !checkLimitY(y_mm)) return false;
+  bool okx = moveToXAbs(x_mm);
+  bool oky = moveToYAbs(y_mm);
+  return okx && oky;
+}
+
+// ==================== Ir a cero ====================
+void goToZeroX() {
+  if (!X_HOMED) { Serial.println(F("⚠️ Primero 'homex'")); return; }
+  moveToXAbs(0.0f);
+  Serial.println(F("OK X=0"));
+}
+void goToZeroY() {
+  if (!Y_HOMED) { Serial.println(F("⚠️ Primero 'homey'")); return; }
+  moveToYAbs(0.0f);
+  Serial.println(F("OK Y=0"));
+}
+
+// ==================== Recorrido de análisis ====================
+void doAnalisis() {
+  Serial.println(F("\n=== ANALISIS: homing + recorrido de puntos ==="));
+
+  // 1) Homing
+  homeX();
+  homeY();
+  if (!X_HOMED || !Y_HOMED) {
+    Serial.println(F("❌ No se pudo completar homing. Abortando analisis."));
+    return;
+  }
+
+  // 2) Puntos en absoluto
+  const uint8_t NPTS = 6;
+  const float PX[NPTS] = { 20.0f, 200.0f, 200.0f,  20.0f,  20.0f, 200.0f };
+  const float PY[NPTS] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
+
+  for (uint8_t i = 0; i < NPTS; ++i) {
+    Serial.print(F("→ Punto P")); Serial.print(i+1);
+    Serial.print(F(" = (")); Serial.print(PX[i],1); Serial.print(F(", "));
+    Serial.print(PY[i],1); Serial.println(F(") mm"));
+
+    if (!moveToXYAbs(PX[i], PY[i])) {
+      Serial.println(F("🚫 Movimiento cancelado por límite. Abortando analisis."));
+      return;
+    }
+
+    // 3) Espera 2 s en cada punto
+    delay(2000);
+  }
+
+  Serial.println(F("✅ ANALISIS completado."));
+}
+
 // ==================== Ayuda ====================
 void printHelp() {
   Serial.println(F("\nComandos:"));
+  Serial.println(F("  analisis    -> homing y recorrido P1..P6 (2s por punto)"));
   Serial.println(F("  home        -> homing X y luego Y"));
   Serial.println(F("  homex       -> homing solo X"));
   Serial.println(F("  homey       -> homing solo Y"));
   Serial.println(F("  g0          -> ir X=0 luego Y=0"));
   Serial.println(F("  g0x         -> ir X=0"));
   Serial.println(F("  g0y         -> ir Y=0"));
-  Serial.println(F("  mmx=<n>     -> mover X n mm"));
-  Serial.println(F("  mmy=<n>     -> mover Y n mm"));
+  Serial.println(F("  mmx=<n>     -> mover X relativo n mm"));
+  Serial.println(F("  mmy=<n>     -> mover Y relativo n mm"));
   Serial.println(F("  pos?        -> mostrar posiciones X/Y"));
   Serial.println(F("  fanon       -> encender ventilador"));
   Serial.println(F("  fanoff      -> apagar ventilador"));
@@ -227,6 +295,8 @@ void parseCommand(String s) {
   s.trim(); s.toLowerCase();
   if (s == "help" || s == "?") { printHelp(); return; }
 
+  if (s == "analisis") { doAnalisis(); return; }
+
   if (s == "homex") { homeX(); return; }
   if (s == "homey") { homeY(); return; }
   if (s == "home")  { homeX(); if (X_HOMED) homeY(); return; }
@@ -236,17 +306,15 @@ void parseCommand(String s) {
   if (s == "g0")  { goToZeroX(); goToZeroY(); return; }
 
   if (s == "pos?") {
-    long px = stepperX->getCurrentPosition();
-    long py = stepperY->getCurrentPosition();
-    Serial.print(F("X: ")); Serial.print(px / X_STEPS_PER_MM, 2); Serial.println(F(" mm"));
-    Serial.print(F("Y: ")); Serial.print(py / Y_STEPS_PER_MM, 2); Serial.println(F(" mm"));
+    Serial.print(F("X: ")); Serial.print(getXmm(), 2); Serial.println(F(" mm"));
+    Serial.print(F("Y: ")); Serial.print(getYmm(), 2); Serial.println(F(" mm"));
     return;
   }
 
+  // Movimientos relativos (mantienen límites)
   if (s.startsWith("mmx=")) {
     float mm = s.substring(4).toFloat();
-    float posActual = stepperX->getCurrentPosition() / X_STEPS_PER_MM;
-    float destino = posActual + mm;
+    float destino = getXmm() + mm;
     if (!checkLimitX(destino)) return;
     long st = mmToStepsX(mm);
     Serial.print(F("→ Mover X ")); Serial.print(mm); Serial.println(F(" mm"));
@@ -258,8 +326,7 @@ void parseCommand(String s) {
 
   if (s.startsWith("mmy=")) {
     float mm = s.substring(4).toFloat();
-    float posActual = stepperY->getCurrentPosition() / Y_STEPS_PER_MM;
-    float destino = posActual + mm;
+    float destino = getYmm() + mm;
     if (!checkLimitY(destino)) return;
     long st = mmToStepsY(mm);
     Serial.print(F("→ Mover Y ")); Serial.print(mm); Serial.println(F(" mm"));
@@ -284,8 +351,8 @@ void parseCommand(String s) {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  Serial.println(F("ESP32 + 2xTB6600 + Límites físicos + Ventilador ON/OFF"));
-  Serial.println(F("Comandos: 'home', 'mmx=', 'mmy=', 'pos?', 'fanon', 'fanoff'\n"));
+  Serial.println(F("ESP32 + 2xTB6600 + Límites + Ventilador ON/OFF + ANALISIS"));
+  Serial.println(F("Comandos: 'analisis', 'home', 'mmx=', 'mmy=', 'pos?', 'fanon', 'fanoff'\n"));
 
   pinMode(X_ENDSTOP_PIN, INPUT_PULLUP);
   pinMode(Y_ENDSTOP_PIN, INPUT_PULLUP);
@@ -297,7 +364,7 @@ void setup() {
   // ---- Eje X ----
   stepperX = engine.stepperConnectToPin(X_STEP_PIN);
   if (!stepperX) { Serial.println(F("Error al inicializar X")); while (1) {} }
-  stepperX->setDirectionPin(X_DIR_PIN, false);
+  stepperX->setDirectionPin(X_DIR_PIN, false); // dirección invertida
   stepperX->setAutoEnable(false);
   stepperX->setSpeedInHz(X_SPEED_HZ);
   stepperX->setAcceleration(X_ACCEL);
@@ -305,7 +372,7 @@ void setup() {
   // ---- Eje Y ----
   stepperY = engine.stepperConnectToPin(Y_STEP_PIN);
   if (!stepperY) { Serial.println(F("Error al inicializar Y")); while (1) {} }
-  stepperY->setDirectionPin(Y_DIR_PIN, false);
+  stepperY->setDirectionPin(Y_DIR_PIN, false); // dirección invertida
   stepperY->setAutoEnable(false);
   stepperY->setSpeedInHz(Y_SPEED_HZ);
   stepperY->setAcceleration(Y_ACCEL);
