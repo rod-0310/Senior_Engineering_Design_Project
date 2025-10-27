@@ -233,14 +233,70 @@ void homeY() {
   if (!Y_HOMED) Serial.println(F("⚠️ Y: Homing fallido"));
 }
 
-// ==================== Movimiento absoluto ====================
+// ==================== Movimiento absoluto (SINCRONIZADO) ====================
+bool moveToXYAbsSync(float x_mm, float y_mm) {
+  // Limites antes de mover
+  if (!checkLimitX(x_mm) || !checkLimitY(y_mm)) return false;
+
+  float curx = getXmm();
+  float cury = getYmm();
+  long dx = mmToStepsX(x_mm - curx);
+  long dy = mmToStepsY(y_mm - cury);
+  long adx = labs(dx);
+  long ady = labs(dy);
+
+  if (adx == 0 && ady == 0) return true; // ya estamos
+
+  // Base común (para que lleguen juntos): usar los mínimos disponibles
+  int baseSpeed  = min(X_SPEED_HZ, Y_SPEED_HZ);
+  int baseAccel  = min(X_ACCEL,    Y_ACCEL);
+
+  long maxSteps = max(adx, ady);
+  // Evitar 0 y valores demasiado bajos
+  auto scaled = [&](long a, int base)->int {
+    if (a == 0) return 0;
+    long v = lround((double)base * (double)a / (double)maxSteps);
+    if (v < 100) v = 100; // umbral mínimo razonable
+    return (int)v;
+  };
+
+  int vx = scaled(adx, baseSpeed);
+  int vy = scaled(ady, baseSpeed);
+  int ax = scaled(adx, baseAccel);
+  int ay = scaled(ady, baseAccel);
+
+  // Guardar parámetros para restaurar luego
+  int old_vx = X_SPEED_HZ, old_ax = X_ACCEL;
+  int old_vy = Y_SPEED_HZ, old_ay = Y_ACCEL;
+
+  // Aplicar parámetros sincronizados
+  if (adx > 0) { stepperX->setSpeedInHz(vx); stepperX->setAcceleration(ax); }
+  if (ady > 0) { stepperY->setSpeedInHz(vy); stepperY->setAcceleration(ay); }
+
+  // Lanzar ambos movimientos casi simultáneamente
+  if (adx > 0) stepperX->move(dx);
+  if (ady > 0) stepperY->move(dy);
+
+  // Esperar hasta que ambos terminen
+  while ((adx > 0 && stepperX->isRunning()) || (ady > 0 && stepperY->isRunning())) {
+    delay(1);
+  }
+
+  // Restaurar parámetros normales
+  stepperX->setSpeedInHz(old_vx);
+  stepperX->setAcceleration(old_ax);
+  stepperY->setSpeedInHz(old_vy);
+  stepperY->setAcceleration(old_ay);
+
+  return true;
+}
+
+// Helpers absolutos por eje (se mantienen por si quieres usarlos)
 bool moveToXAbs(float x_mm) {
   if (!checkLimitX(x_mm)) return false;
   float cur = getXmm();
-  float delta = x_mm - cur;
-  long st = mmToStepsX(delta);
+  long st = mmToStepsX(x_mm - cur);
   if (st == 0) return true;
-  Serial.print(F("→ X a ")); Serial.print(x_mm, 2); Serial.println(F(" mm (abs)"));
   stepperX->move(st);
   waitUntilStop(stepperX);
   return true;
@@ -248,19 +304,11 @@ bool moveToXAbs(float x_mm) {
 bool moveToYAbs(float y_mm) {
   if (!checkLimitY(y_mm)) return false;
   float cur = getYmm();
-  float delta = y_mm - cur;
-  long st = mmToStepsY(delta);
+  long st = mmToStepsY(y_mm - cur);
   if (st == 0) return true;
-  Serial.print(F("→ Y a ")); Serial.print(y_mm, 2); Serial.println(F(" mm (abs)"));
   stepperY->move(st);
   waitUntilStop(stepperY);
   return true;
-}
-bool moveToXYAbs(float x_mm, float y_mm) {
-  if (!checkLimitX(x_mm) || !checkLimitY(y_mm)) return false;
-  bool okx = moveToXAbs(x_mm);
-  bool oky = moveToYAbs(y_mm);
-  return okx && oky;
 }
 
 // ==================== Ir a cero ====================
@@ -277,7 +325,7 @@ void goToZeroY() {
 
 // ==================== ANALISIS ====================
 void doAnalisis() {
-  Serial.println(F("\n=== ANALISIS: homing + recorrido de puntos ==="));
+  Serial.println(F("\n=== ANALISIS: homing + recorrido de puntos (simultáneo) ==="));
 
   // Homing con pre-desenganche ya integrado
   homeX();
@@ -297,7 +345,7 @@ void doAnalisis() {
     Serial.print(F(" = (")); Serial.print(PX[i],1); Serial.print(F(", "));
     Serial.print(PY[i],1); Serial.println(F(") mm"));
 
-    if (!moveToXYAbs(PX[i], PY[i])) {
+    if (!moveToXYAbsSync(PX[i], PY[i])) {
       Serial.println(F("🚫 Movimiento cancelado por límite. Abortando analisis."));
       return;
     }
@@ -310,14 +358,12 @@ void doAnalisis() {
 
 // ==================== Ir directo a P1..P6 ====================
 void gotoPoint(uint8_t idx1based) {
-  // Coordenadas de P1..P6
   const float PX[6] = { 20.0f, 200.0f, 200.0f,  20.0f,  20.0f, 200.0f };
   const float PY[6] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
 
   if (idx1based < 1 || idx1based > 6) return;
   uint8_t i = idx1based - 1;
 
-  // Si no está homed, hacer homing primero
   if (!X_HOMED || !Y_HOMED) {
     Serial.println(F("ℹ️ No homed: realizando homing antes de ir al punto..."));
     homeX();
@@ -331,7 +377,8 @@ void gotoPoint(uint8_t idx1based) {
   Serial.print(F("→ Ir a P")); Serial.print(idx1based);
   Serial.print(F(" (")); Serial.print(PX[i],1); Serial.print(F(", "));
   Serial.print(PY[i],1); Serial.println(F(") mm"));
-  if (!moveToXYAbs(PX[i], PY[i])) {
+
+  if (!moveToXYAbsSync(PX[i], PY[i])) {
     Serial.println(F("🚫 Movimiento cancelado por límite."));
   } else {
     Serial.println(F("OK punto alcanzado."));
@@ -341,8 +388,8 @@ void gotoPoint(uint8_t idx1based) {
 // ==================== Ayuda ====================
 void printHelp() {
   Serial.println(F("\nComandos:"));
-  Serial.println(F("  analisis    -> homing y recorrido P1..P6 (2s por punto)"));
-  Serial.println(F("  p1..p6      -> ir directo al punto P1..P6"));
+  Serial.println(F("  analisis    -> homing y recorrido P1..P6 (2s por punto, XY simultáneo)"));
+  Serial.println(F("  p1..p6      -> ir directo al punto P1..P6 (XY simultáneo)"));
   Serial.println(F("  home        -> homing X y luego Y (con pre-desenganche 5mm)"));
   Serial.println(F("  homex       -> homing solo X (con pre-desenganche)"));
   Serial.println(F("  homey       -> homing solo Y (con pre-desenganche)"));
@@ -387,7 +434,7 @@ void parseCommand(String s) {
     return;
   }
 
-  // Movimientos relativos con límites
+  // Movimientos relativos individuales (se mantienen como antes)
   if (s.startsWith("mmx=")) {
     float mm = s.substring(4).toFloat();
     float destino = getXmm() + mm;
@@ -399,7 +446,6 @@ void parseCommand(String s) {
     Serial.println(F("OK X movido"));
     return;
   }
-
   if (s.startsWith("mmy=")) {
     float mm = s.substring(4).toFloat();
     float destino = getYmm() + mm;
@@ -427,7 +473,7 @@ void parseCommand(String s) {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  Serial.println(F("ESP32 + 2xTB6600 + Límites + Ventilador ON/OFF + ANALISIS + P1..P6"));
+  Serial.println(F("ESP32 + 2xTB6600 + Límites + Ventilador ON/OFF + ANALISIS + P1..P6 (XY simultáneo)"));
   Serial.println(F("Comandos: 'analisis', 'p1..p6', 'home', 'mmx=', 'mmy=', 'pos?', 'fanon', 'fanoff'\n"));
 
   pinMode(X_ENDSTOP_PIN, INPUT_PULLUP);

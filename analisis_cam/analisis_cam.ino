@@ -34,7 +34,7 @@ FastAccelStepper* stepperX = nullptr;
 FastAccelStepper* stepperY = nullptr;
 
 // ===== Parámetros por eje =====
-float X_STEPS_PER_MM = 40.0f;    // calibrado para GT2 20 dientes
+float X_STEPS_PER_MM = 40.0f;    // ✅ calibrado para GT2 20 dientes
 float Y_STEPS_PER_MM = 50.0f;    // ajusta si es distinto
 
 int   X_SPEED_HZ = 10000;
@@ -99,7 +99,7 @@ void fanWrite(bool on) {
 void fanOn()  { fanWrite(true);  }
 void fanOff() { fanWrite(false); }
 
-// ==================== HOMING BÁSICO ====================
+// ==================== HOMING ====================
 bool doHomeAxis(FastAccelStepper* s,
                 bool (*endstopPressed)(),
                 bool homeTowardNeg,
@@ -156,7 +156,23 @@ bool doHomeAxis(FastAccelStepper* s,
   return true;
 }
 
-// ==================== Límites ====================
+// ===== Wrappers de Homing =====
+void homeX() {
+  Serial.println(F("\n=== HOMING X ==="));
+  X_HOMED = doHomeAxis(stepperX, endstopXPressed, X_HOME_TOWARD_NEG,
+                       X_HOME_BACKOFF_MM, X_HOME_FAST_HZ, X_HOME_SLOW_HZ,
+                       X_SPEED_HZ, X_ACCEL, X_STEPS_PER_MM);
+  if (!X_HOMED) Serial.println(F("⚠️ X: Homing fallido"));
+}
+void homeY() {
+  Serial.println(F("\n=== HOMING Y ==="));
+  Y_HOMED = doHomeAxis(stepperY, endstopYPressed, Y_HOME_TOWARD_NEG,
+                       Y_HOME_BACKOFF_MM, Y_HOME_FAST_HZ, Y_HOME_SLOW_HZ,
+                       Y_SPEED_HZ, Y_ACCEL, Y_STEPS_PER_MM);
+  if (!Y_HOMED) Serial.println(F("⚠️ Y: Homing fallido"));
+}
+
+// ==================== Lógica de Límites ====================
 bool checkLimitX(float mmTarget) {
   if (!X_HOMED) return true; // antes del homing, no limitar
   if (mmTarget < 0 || mmTarget > X_MAX_MM) {
@@ -176,64 +192,7 @@ bool checkLimitY(float mmTarget) {
   return true;
 }
 
-// ==================== PRE-DESENGANCHE (5 mm lejos del home) ====================
-void preUnlatchX(float travel_mm = 5.0f) {
-  int away_dir = X_HOME_TOWARD_NEG ? +1 : -1;
-  float cur = getXmm();
-  float target = cur + away_dir * travel_mm;
-  if (X_HOMED) {
-    if (target < 0)        target = 0;
-    if (target > X_MAX_MM) target = X_MAX_MM;
-  }
-  float delta = target - cur;
-  long st = mmToStepsX(delta);
-  if (st == 0) return;
-  Serial.print(F("↪ Desenganche X ")); Serial.print(delta, 2); Serial.println(F(" mm"));
-  stepperX->setSpeedInHz(X_SPEED_HZ);
-  stepperX->setAcceleration(X_ACCEL);
-  stepperX->move(st);
-  waitUntilStop(stepperX);
-  delay(50);
-}
-
-void preUnlatchY(float travel_mm = 5.0f) {
-  int away_dir = Y_HOME_TOWARD_NEG ? +1 : -1;
-  float cur = getYmm();
-  float target = cur + away_dir * travel_mm;
-  if (Y_HOMED) {
-    if (target < 0)        target = 0;
-    if (target > Y_MAX_MM) target = Y_MAX_MM;
-  }
-  float delta = target - cur;
-  long st = mmToStepsY(delta);
-  if (st == 0) return;
-  Serial.print(F("↪ Desenganche Y ")); Serial.print(delta, 2); Serial.println(F(" mm"));
-  stepperY->setSpeedInHz(Y_SPEED_HZ);
-  stepperY->setAcceleration(Y_ACCEL);
-  stepperY->move(st);
-  waitUntilStop(stepperY);
-  delay(50);
-}
-
-// ===== Wrappers de Homing (con pre-desenganche 5 mm) =====
-void homeX() {
-  Serial.println(F("\n=== HOMING X ==="));
-  preUnlatchX(5.0f);
-  X_HOMED = doHomeAxis(stepperX, endstopXPressed, X_HOME_TOWARD_NEG,
-                       X_HOME_BACKOFF_MM, X_HOME_FAST_HZ, X_HOME_SLOW_HZ,
-                       X_SPEED_HZ, X_ACCEL, X_STEPS_PER_MM);
-  if (!X_HOMED) Serial.println(F("⚠️ X: Homing fallido"));
-}
-void homeY() {
-  Serial.println(F("\n=== HOMING Y ==="));
-  preUnlatchY(5.0f);
-  Y_HOMED = doHomeAxis(stepperY, endstopYPressed, Y_HOME_TOWARD_NEG,
-                       Y_HOME_BACKOFF_MM, Y_HOME_FAST_HZ, Y_HOME_SLOW_HZ,
-                       Y_SPEED_HZ, Y_ACCEL, Y_STEPS_PER_MM);
-  if (!Y_HOMED) Serial.println(F("⚠️ Y: Homing fallido"));
-}
-
-// ==================== Movimiento absoluto ====================
+// ==================== Movimiento absoluto (por ejes) ====================
 bool moveToXAbs(float x_mm) {
   if (!checkLimitX(x_mm)) return false;
   float cur = getXmm();
@@ -256,7 +215,10 @@ bool moveToYAbs(float y_mm) {
   waitUntilStop(stepperY);
   return true;
 }
+
+// Mover a XY absolutos (secuencial X luego Y). Si prefieres Y primero, invierte el orden.
 bool moveToXYAbs(float x_mm, float y_mm) {
+  // Verifica límites antes de mover
   if (!checkLimitX(x_mm) || !checkLimitY(y_mm)) return false;
   bool okx = moveToXAbs(x_mm);
   bool oky = moveToYAbs(y_mm);
@@ -275,11 +237,11 @@ void goToZeroY() {
   Serial.println(F("OK Y=0"));
 }
 
-// ==================== ANALISIS ====================
+// ==================== Recorrido de análisis ====================
 void doAnalisis() {
   Serial.println(F("\n=== ANALISIS: homing + recorrido de puntos ==="));
 
-  // Homing con pre-desenganche ya integrado
+  // 1) Homing
   homeX();
   homeY();
   if (!X_HOMED || !Y_HOMED) {
@@ -287,7 +249,7 @@ void doAnalisis() {
     return;
   }
 
-  // Puntos absolutos
+  // 2) Puntos en absoluto
   const uint8_t NPTS = 6;
   const float PX[NPTS] = { 20.0f, 200.0f, 200.0f,  20.0f,  20.0f, 200.0f };
   const float PY[NPTS] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
@@ -302,55 +264,25 @@ void doAnalisis() {
       return;
     }
 
-    delay(2000); // 2 s en cada punto
+    // 3) Espera 2 s en cada punto
+    delay(2000);
   }
 
   Serial.println(F("✅ ANALISIS completado."));
-}
-
-// ==================== Ir directo a P1..P6 ====================
-void gotoPoint(uint8_t idx1based) {
-  // Coordenadas de P1..P6
-  const float PX[6] = { 20.0f, 200.0f, 200.0f,  20.0f,  20.0f, 200.0f };
-  const float PY[6] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
-
-  if (idx1based < 1 || idx1based > 6) return;
-  uint8_t i = idx1based - 1;
-
-  // Si no está homed, hacer homing primero
-  if (!X_HOMED || !Y_HOMED) {
-    Serial.println(F("ℹ️ No homed: realizando homing antes de ir al punto..."));
-    homeX();
-    homeY();
-    if (!X_HOMED || !Y_HOMED) {
-      Serial.println(F("❌ Homing falló. No se puede ir al punto."));
-      return;
-    }
-  }
-
-  Serial.print(F("→ Ir a P")); Serial.print(idx1based);
-  Serial.print(F(" (")); Serial.print(PX[i],1); Serial.print(F(", "));
-  Serial.print(PY[i],1); Serial.println(F(") mm"));
-  if (!moveToXYAbs(PX[i], PY[i])) {
-    Serial.println(F("🚫 Movimiento cancelado por límite."));
-  } else {
-    Serial.println(F("OK punto alcanzado."));
-  }
 }
 
 // ==================== Ayuda ====================
 void printHelp() {
   Serial.println(F("\nComandos:"));
   Serial.println(F("  analisis    -> homing y recorrido P1..P6 (2s por punto)"));
-  Serial.println(F("  p1..p6      -> ir directo al punto P1..P6"));
-  Serial.println(F("  home        -> homing X y luego Y (con pre-desenganche 5mm)"));
-  Serial.println(F("  homex       -> homing solo X (con pre-desenganche)"));
-  Serial.println(F("  homey       -> homing solo Y (con pre-desenganche)"));
+  Serial.println(F("  home        -> homing X y luego Y"));
+  Serial.println(F("  homex       -> homing solo X"));
+  Serial.println(F("  homey       -> homing solo Y"));
   Serial.println(F("  g0          -> ir X=0 luego Y=0"));
   Serial.println(F("  g0x         -> ir X=0"));
   Serial.println(F("  g0y         -> ir Y=0"));
-  Serial.println(F("  mmx=<n>     -> mover X n mm (relativo)"));
-  Serial.println(F("  mmy=<n>     -> mover Y n mm (relativo)"));
+  Serial.println(F("  mmx=<n>     -> mover X relativo n mm"));
+  Serial.println(F("  mmy=<n>     -> mover Y relativo n mm"));
   Serial.println(F("  pos?        -> mostrar posiciones X/Y"));
   Serial.println(F("  fanon       -> encender ventilador"));
   Serial.println(F("  fanoff      -> apagar ventilador"));
@@ -364,14 +296,6 @@ void parseCommand(String s) {
   if (s == "help" || s == "?") { printHelp(); return; }
 
   if (s == "analisis") { doAnalisis(); return; }
-
-  // Puntos directos
-  if (s == "p1") { gotoPoint(1); return; }
-  if (s == "p2") { gotoPoint(2); return; }
-  if (s == "p3") { gotoPoint(3); return; }
-  if (s == "p4") { gotoPoint(4); return; }
-  if (s == "p5") { gotoPoint(5); return; }
-  if (s == "p6") { gotoPoint(6); return; }
 
   if (s == "homex") { homeX(); return; }
   if (s == "homey") { homeY(); return; }
@@ -387,7 +311,7 @@ void parseCommand(String s) {
     return;
   }
 
-  // Movimientos relativos con límites
+  // Movimientos relativos (mantienen límites)
   if (s.startsWith("mmx=")) {
     float mm = s.substring(4).toFloat();
     float destino = getXmm() + mm;
@@ -427,8 +351,8 @@ void parseCommand(String s) {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  Serial.println(F("ESP32 + 2xTB6600 + Límites + Ventilador ON/OFF + ANALISIS + P1..P6"));
-  Serial.println(F("Comandos: 'analisis', 'p1..p6', 'home', 'mmx=', 'mmy=', 'pos?', 'fanon', 'fanoff'\n"));
+  Serial.println(F("ESP32 + 2xTB6600 + Límites + Ventilador ON/OFF + ANALISIS"));
+  Serial.println(F("Comandos: 'analisis', 'home', 'mmx=', 'mmy=', 'pos?', 'fanon', 'fanoff'\n"));
 
   pinMode(X_ENDSTOP_PIN, INPUT_PULLUP);
   pinMode(Y_ENDSTOP_PIN, INPUT_PULLUP);
