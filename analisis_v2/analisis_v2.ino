@@ -125,7 +125,7 @@ bool doHomeAxis(FastAccelStepper* s,
   }
 
   if (!endstopPressed()) {
-    Serial.println(F("  ❌ ERROR: endstop no detectado."));
+    Serial.println(F("ERROR: endstop no detectado."));
     s->setSpeedInHz(speed_normal_hz);
     s->setAcceleration(accel_normal);
     return false;
@@ -152,7 +152,7 @@ bool doHomeAxis(FastAccelStepper* s,
   s->setCurrentPosition(0);
   s->setSpeedInHz(speed_normal_hz);
   s->setAcceleration(accel_normal);
-  Serial.println(F("  ✅ Homing OK (pos = 0)"));
+  Serial.println(F("Homing OK (pos = 0)"));
   return true;
 }
 
@@ -160,7 +160,7 @@ bool doHomeAxis(FastAccelStepper* s,
 bool checkLimitX(float mmTarget) {
   if (!X_HOMED) return true; // antes del homing, no limitar
   if (mmTarget < 0 || mmTarget > X_MAX_MM) {
-    Serial.print(F("🚫 Límite X excedido: ")); Serial.print(mmTarget);
+    Serial.print(F("Límite X excedido: ")); Serial.print(mmTarget);
     Serial.print(F(" mm (rango 0–")); Serial.print(X_MAX_MM); Serial.println(F(" mm)"));
     return false;
   }
@@ -169,8 +169,8 @@ bool checkLimitX(float mmTarget) {
 bool checkLimitY(float mmTarget) {
   if (!Y_HOMED) return true;
   if (mmTarget < 0 || mmTarget > Y_MAX_MM) {
-    Serial.print(F("🚫 Límite Y excedido: ")); Serial.print(mmTarget);
-    Serial.print(F(" mm (rango 0–")); Serial.print(Y_MAX_MM); Serial.println(F(" mm)"));
+    Serial.print(F("Límite Y excedido: ")); Serial.print(mmTarget);
+    Serial.print(F(" mm (rango 0")); Serial.print(Y_MAX_MM); Serial.println(F(" mm)"));
     return false;
   }
   return true;
@@ -331,7 +331,7 @@ void doAnalisis() {
   homeX();
   homeY();
   if (!X_HOMED || !Y_HOMED) {
-    Serial.println(F("❌ No se pudo completar homing. Abortando analisis."));
+    Serial.println(F("No se pudo completar homing. Abortando analisis."));
     return;
   }
 
@@ -346,14 +346,14 @@ void doAnalisis() {
     Serial.print(PY[i],1); Serial.println(F(") mm"));
 
     if (!moveToXYAbsSync(PX[i], PY[i])) {
-      Serial.println(F("🚫 Movimiento cancelado por límite. Abortando analisis."));
+      Serial.println(F("Movimiento cancelado por límite. Abortando analisis."));
       return;
     }
 
     delay(2000); // 2 s en cada punto
   }
 
-  Serial.println(F("✅ ANALISIS completado."));
+  Serial.println(F("ANALISIS completado."));
 }
 
 // ==================== Ir directo a P1..P6 ====================
@@ -369,7 +369,7 @@ void gotoPoint(uint8_t idx1based) {
     homeX();
     homeY();
     if (!X_HOMED || !Y_HOMED) {
-      Serial.println(F("❌ Homing falló. No se puede ir al punto."));
+      Serial.println(F("Homing falló. No se puede ir al punto."));
       return;
     }
   }
@@ -379,7 +379,7 @@ void gotoPoint(uint8_t idx1based) {
   Serial.print(PY[i],1); Serial.println(F(") mm"));
 
   if (!moveToXYAbsSync(PX[i], PY[i])) {
-    Serial.println(F("🚫 Movimiento cancelado por límite."));
+    Serial.println(F("Movimiento cancelado por límite."));
   } else {
     Serial.println(F("OK punto alcanzado."));
   }
