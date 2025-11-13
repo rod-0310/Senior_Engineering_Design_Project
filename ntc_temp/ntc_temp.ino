@@ -3,7 +3,7 @@
 // ================== AJUSTES PARA ESP32 ==================
 // Usaremos un pin ADC de ESP32 (ADC1) seguro para lecturas analógicas.
 // Opciones típicas: 32, 33, 34, 35, 36, 39 (34-39 son solo entrada).
-#define PIN_THERMISTOR 34
+#define PIN_THERMISTOR 35
 
 // ESP32 tiene ADC de 12 bits por defecto (0–4095).
 // Mantengo tus parámetros del NTC y el promedio de 10 muestras.
@@ -11,7 +11,7 @@ SmoothThermistor thermistor(
   PIN_THERMISTOR,        // Pin analógico (ESP32)
   ADC_SIZE_12_BIT,       // Resolución ADC ESP32 (0–4095)
   100000,                // Resistencia nominal del NTC (100kΩ @ 25°C)
-  10000,                 // Resistencia serie (10kΩ)
+  100000,                 // Resistencia serie (10kΩ)
   3950,                  // Coeficiente Beta (ajusta si conoces el exacto)
   25,                    // Temp. nominal (°C)
   10                     // Muestras por lectura (promedio)

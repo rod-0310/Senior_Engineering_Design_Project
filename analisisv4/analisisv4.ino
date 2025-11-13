@@ -41,9 +41,9 @@ static const float PY[6] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
 #define X_ENDSTOP_PIN  13
 #define X_ENDSTOP_ACTIVE_LOW 1
 // Eje Y
-#define Y_STEP_PIN     25
-#define Y_DIR_PIN      26
-#define Y_ENDSTOP_PIN  27
+#define Y_STEP_PIN     23 
+#define Y_DIR_PIN      16
+#define Y_ENDSTOP_PIN  32   //Antes 27
 #define Y_ENDSTOP_ACTIVE_LOW 1
 
 // ---------- Ventilador PWM por timer (un solo pin) ----------
@@ -72,7 +72,7 @@ const int   Y_HOME_FAST_HZ = 5000;
 const int   Y_HOME_SLOW_HZ = 1200;
 
 // Direcciones
-const bool X_DIR_INVERTED = false;
+const bool X_DIR_INVERTED = true;
 const bool Y_DIR_INVERTED = false;
 
 // ========================= MOTOR ENGINE =========================
@@ -327,7 +327,7 @@ static void vTaskUI(void*){
   OUT_println("  g0   | g0x   | g0y");
   OUT_println("  mmx=<n> | mmy=<n>");
   OUT_println("  pos?");
-  OUT_println("  fanon | fanoff | fan? | fanp=<0–255>\n");
+  OUT_println("  fanon | fanoff | fan? | fanp=<0-255>\n");
 
   for(;;){
     // entrada por USB
