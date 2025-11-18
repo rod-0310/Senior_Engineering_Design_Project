@@ -26,12 +26,12 @@ static inline void OUT_println(const char* s) { Serial.println(s); }
 #define MAINS_FREQ_HZ        50
 static const uint32_t HALF_CYCLE_US = (1000000UL / (MAINS_FREQ_HZ * 2));
 
-double SETPOINT_C = 26.0;
+double SETPOINT_C = 25.0;
 const double SP_MIN = 0.0;
 const double SP_MAX = 80.0;
 
 // PID_v1 — Ts=0.1 s
-double Kp = 3.3450;
+double Kp = 1.3450;
 double Ki = 1.0849;
 double Kd = 0.9846;
 const uint16_t PID_SAMPLE_MS = 100;
@@ -191,7 +191,7 @@ inline double clampSP(double sp){
 }
 
 /* =====================================================================
- *  BLOQUE 2: CNC 2 EJES + VENTILADOR PWM (PIN 17)
+ *  BLOQUE 2: CNC 2 EJES + LED DE ANÁLISIS PWM
  * ===================================================================== */
 
 static const float PX[6] = { 20.0f, 200.0f, 200.0f,  20.0f,  20.0f, 200.0f };
@@ -208,8 +208,13 @@ static const float PY[6] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
 #define Y_ENDSTOP_PIN  32
 #define Y_ENDSTOP_ACTIVE_LOW 1
 
-// Ventilador PWM CNC
-#define FAN_PWM_PIN    15
+// Pines de habilitación de drivers
+#define X_ENABLE_PIN   21
+#define Y_ENABLE_PIN   22
+const bool ENABLE_ACTIVE_LOW = true;   // LOW = enable, HIGH = disable
+
+// LED de análisis PWM (antes "ventilador CNC")
+#define LED_ANALISIS_PIN    15
 
 // Límites
 const float X_MAX_MM = 220.0f;
@@ -226,8 +231,8 @@ int   Y_ACCEL    = 20000;
 // Homing
 const bool  X_HOME_TOWARD_NEG = true;
 const bool  Y_HOME_TOWARD_NEG = true;
-const float X_HOME_BACKOFF_MM = 5.0f;
-const float Y_HOME_BACKOFF_MM = 5.0f;
+const float X_HOME_BACKOFF_MM = 8.0f;
+const float Y_HOME_BACKOFF_MM = 8.0f;
 const int   X_HOME_FAST_HZ = 5000;
 const int   X_HOME_SLOW_HZ = 1200;
 const int   Y_HOME_FAST_HZ = 5000;
@@ -247,6 +252,7 @@ FastAccelStepper* stepperY = nullptr;
 #define EV_MOTION_BUSY (1<<2)
 
 static EventGroupHandle_t eg;
+static int motion_busy_depth = 0;   // nivel de anidación de secciones "busy"
 
 inline long  mmToStepsX(float mm){ return lroundf(mm * X_STEPS_PER_MM); }
 inline long  mmToStepsY(float mm){ return lroundf(mm * Y_STEPS_PER_MM); }
@@ -396,25 +402,34 @@ void taskActuators(void* pv) {
   }
 }
 
-/* ========================= FAN CONTROL CNC ========================= */
-static volatile uint8_t  fan_pwm     = 0;
-static volatile bool     fan_on      = false;
-static volatile uint16_t fan_pwm_cnt = 0;
-static hw_timer_t*       fanTimer    = nullptr;
+/* ========================= LED DE ANÁLISIS PWM (ANTES FAN CNC) ========================= */
+static volatile uint8_t  led_pwm     = 0;
+static volatile bool     led_on      = false;
+static volatile uint16_t led_pwm_cnt = 0;
+static hw_timer_t*       ledTimer    = nullptr;
 
-void IRAM_ATTR fanTimerISR() {
-  uint8_t duty = fan_on ? fan_pwm : 0;
-  if (fan_pwm_cnt < duty) GPIO.out_w1ts = (1UL << FAN_PWM_PIN);
-  else                    GPIO.out_w1tc = (1UL << FAN_PWM_PIN);
-  fan_pwm_cnt++;
-  if (fan_pwm_cnt >= 256) fan_pwm_cnt = 0;
+void IRAM_ATTR ledTimerISR() {
+  uint8_t duty = led_on ? led_pwm : 0;
+  if (led_pwm_cnt < duty) GPIO.out_w1ts = (1UL << LED_ANALISIS_PIN);
+  else                    GPIO.out_w1tc = (1UL << LED_ANALISIS_PIN);
+  led_pwm_cnt++;
+  if (led_pwm_cnt >= 256) led_pwm_cnt = 0;
 }
 
-void fanOn()    { fan_on = true;  if (fan_pwm == 0) fan_pwm = 255; }
-void fanOff()   { fan_on = false; }
-void fanSetPower(uint8_t p) {
-  fan_pwm = p;
-  fan_on  = (p > 0);
+void ledOn()    { led_on = true;  if (led_pwm == 0) led_pwm = 255; }
+void ledOff()   { led_on = false; }
+void ledSetPower(uint8_t p) {
+  led_pwm = p;
+  led_on  = (p > 0);
+}
+
+/* ========================= HABILITACIÓN MOTORES ========================= */
+static void motorsEnable(bool on){
+  uint8_t lvl = ENABLE_ACTIVE_LOW
+                ? (on ? LOW : HIGH)
+                : (on ? HIGH : LOW);
+  digitalWrite(X_ENABLE_PIN, lvl);
+  digitalWrite(Y_ENABLE_PIN, lvl);
 }
 
 /* ========================= LIMITES Y HOMING ========================= */
@@ -555,8 +570,8 @@ typedef enum : uint8_t {
   CMD_P1, CMD_P2, CMD_P3, CMD_P4, CMD_P5, CMD_P6,
   CMD_REL_MMX, CMD_REL_MMY,
   CMD_POSQ,
-  CMD_FAN_ON, CMD_FAN_OFF, CMD_FAN_Q,
-  CMD_FAN_POWER,
+  CMD_LED_ON, CMD_LED_OFF, CMD_LED_Q,
+  CMD_LED_POWER,
   // PID
   CMD_PID_KP,
   CMD_PID_KI,
@@ -582,9 +597,23 @@ static TaskHandle_t hMotion = nullptr;
 
 static String cmdBuf;
 
+/* --- Busy + habilitación drivers con contador anidado --- */
 static void setBusy(bool on){
-  if (on) xEventGroupSetBits(eg, EV_MOTION_BUSY);
-  else    xEventGroupClearBits(eg, EV_MOTION_BUSY);
+  if (on) {
+    if (motion_busy_depth == 0) {
+      motorsEnable(true);                 // habilita drivers (LOW en ENABLE)
+      xEventGroupSetBits(eg, EV_MOTION_BUSY);
+    }
+    motion_busy_depth++;
+  } else {
+    if (motion_busy_depth > 0) {
+      motion_busy_depth--;
+      if (motion_busy_depth == 0) {
+        motorsEnable(false);             // deshabilita drivers al terminar todo movimiento
+        xEventGroupClearBits(eg, EV_MOTION_BUSY);
+      }
+    }
+  }
 }
 
 static void uiSend(CmdType t, float v=0){
@@ -602,14 +631,14 @@ static void parseLineAndDispatch(const String& sIn){
     OUT_println("  kp <v>, ki <v>, kd <v>");
     OUT_println("  sp <v>, sp+ <d>, sp- <d>");
     OUT_println("  show, sens, safe on, safe off");
-    OUT_println("\nComandos MOTORES:");
+    OUT_println("\nComandos MOTORES + LED:");
     OUT_println("  analisis");
     OUT_println("  p1..p6");
     OUT_println("  home | homex | homey");
     OUT_println("  g0   | g0x   | g0y");
     OUT_println("  mmx=<n> | mmy=<n>");
     OUT_println("  pos?");
-    OUT_println("  fanon | fanoff | fan? | fanp=<0–255>\n");
+    OUT_println("  ledon | ledoff | led? | ledp=<0-255>\n");
     return;
   }
 
@@ -625,7 +654,7 @@ static void parseLineAndDispatch(const String& sIn){
   else if (s=="safe on") uiSend(CMD_PID_SAFE_ON);
   else if (s=="safe off")uiSend(CMD_PID_SAFE_OFF);
 
-  // === MOTORES ===
+  // === MOTORES + LED ===
   else if (s=="analisis")  uiSend(CMD_ANALISIS);
   else if (s=="homex")     uiSend(CMD_HOME_X);
   else if (s=="homey")     uiSend(CMD_HOME_Y);
@@ -640,10 +669,10 @@ static void parseLineAndDispatch(const String& sIn){
   else if (s=="p5")        uiSend(CMD_P5);
   else if (s=="p6")        uiSend(CMD_P6);
   else if (s=="pos?")      uiSend(CMD_POSQ);
-  else if (s=="fanon")     uiSend(CMD_FAN_ON);
-  else if (s=="fanoff")    uiSend(CMD_FAN_OFF);
-  else if (s=="fan?")      uiSend(CMD_FAN_Q);
-  else if (s.startsWith("fanp=")) uiSend(CMD_FAN_POWER, s.substring(5).toFloat());
+  else if (s=="ledon")     uiSend(CMD_LED_ON);
+  else if (s=="ledoff")    uiSend(CMD_LED_OFF);
+  else if (s=="led?")      uiSend(CMD_LED_Q);
+  else if (s.startsWith("ledp=")) uiSend(CMD_LED_POWER, s.substring(5).toFloat());
   else if (s.startsWith("mmx="))  uiSend(CMD_REL_MMX,   s.substring(4).toFloat());
   else if (s.startsWith("mmy="))  uiSend(CMD_REL_MMY,   s.substring(4).toFloat());
   else OUT_println("Comando invalido. Escribe 'help'.");
@@ -662,7 +691,7 @@ static void handleStream(Stream& in, String& buf) {
 }
 
 static void vTaskUI(void*){
-  OUT_println("ESP32 listo. Usa 'help' para ver comandos (PID + MOTORES).");
+  OUT_println("ESP32 listo. Usa 'help' para ver comandos (PID + MOTORES + LED).");
   for(;;){
     handleStream(Serial, cmdBuf);
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -703,21 +732,41 @@ static void go0Y(){ setBusy(true); (void)moveToXYAbsSync(getXmm(), 0.0f); setBus
 
 static void doAnalisis(){
   setBusy(true);
-  homeX(); homeY();
+  OUT_println("\n=== ANALISIS ===");
+
+  // LED de análisis encendido durante todo el análisis
+  ledOn();
+
+  // Homing antes de empezar
+  homeX();
+  homeY();
   EventBits_t b = xEventGroupGetBits(eg);
   if (!(b & EV_X_HOMED) || !(b & EV_Y_HOMED)){
     OUT_println("! Homing falló. Aborto.");
+    ledOff();
     setBusy(false);
     return;
   }
+
+  // Recorrido por los puntos P1..P6
   for (uint8_t i=0;i<6;i++){
     char msg[64];
     snprintf(msg, sizeof(msg), "→ P%d = (%.1f, %.1f)", i+1, PX[i], PY[i]);
     OUT_println(msg);
-    if (!moveToXYAbsSync(PX[i], PY[i])){ OUT_println("  ! Límite; Analisis abortado"); break; }
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    if (!moveToXYAbsSync(PX[i], PY[i])){
+      OUT_println("  ! Límite; Analisis abortado");
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));   // tiempo en cada punto
   }
-  OUT_println("ANALISIS listo.");
+
+  // Al terminar el análisis, regresar a HOME (0,0)
+  OUT_println("Regresando a HOME (0,0)...");
+  (void)moveToXYAbsSync(0.0f, 0.0f);
+  OUT_println("ANALISIS listo. Posición HOME (0,0).");
+
+  // Apagar LED y liberar busy (esto apaga motores)
+  ledOff();
   setBusy(false);
 }
 
@@ -742,27 +791,27 @@ static void vTaskMotion(void*){
           OUT_println("  kp <v>, ki <v>, kd <v>");
           OUT_println("  sp <v>, sp+ <d>, sp- <d>");
           OUT_println("  show, sens, safe on, safe off");
-          OUT_println("\nComandos MOTORES:");
+          OUT_println("\nComandos MOTORES + LED:");
           OUT_println("  analisis");
           OUT_println("  p1..p6");
           OUT_println("  home | homex | homey");
           OUT_println("  g0   | g0x   | g0y");
           OUT_println("  mmx=<n> | mmy=<n>");
           OUT_println("  pos?");
-          OUT_println("  fanon | fanoff | fan? | fanp=<0–255>\n");
+          OUT_println("  ledon | ledoff | led? | ledp=<0–255>\n");
           break;
 
-        case CMD_FAN_ON:     fanOn();  OUT_println("Fan PWM (pin 17) ON"); break;
-        case CMD_FAN_OFF:    fanOff(); OUT_println("Fan PWM (pin 17) OFF"); break;
-        case CMD_FAN_Q: {
+        case CMD_LED_ON:     ledOn();  OUT_println("LED análisis ON"); break;
+        case CMD_LED_OFF:    ledOff(); OUT_println("LED análisis OFF"); break;
+        case CMD_LED_Q: {
           char msg[32];
-          snprintf(msg,sizeof(msg),"Fan17: %s PWM=%u", fan_on?"ON":"OFF", fan_pwm);
+          snprintf(msg,sizeof(msg),"LED: %s PWM=%u", led_on?"ON":"OFF", led_pwm);
           OUT_println(msg);
         } break;
-        case CMD_FAN_POWER: {
+        case CMD_LED_POWER: {
           uint8_t p = (uint8_t)c.value;
-          fanSetPower(p);
-          char msg[32]; snprintf(msg,sizeof(msg),"Fan17 PWM = %u", p);
+          ledSetPower(p);
+          char msg[32]; snprintf(msg,sizeof(msg),"LED PWM = %u", p);
           OUT_println(msg);
         } break;
 
@@ -870,14 +919,19 @@ void setup() {
   pinMode(X_ENDSTOP_PIN, INPUT_PULLUP);
   pinMode(Y_ENDSTOP_PIN, INPUT_PULLUP);
 
-  // Ventilador CNC PWM en pin 17
-  pinMode(FAN_PWM_PIN, OUTPUT);
-  GPIO.out_w1tc = (1UL << FAN_PWM_PIN);
-  fanTimer = timerBegin(250000);   // 250 kHz -> ~976 Hz (256 niveles)
-  timerAttachInterrupt(fanTimer, fanTimerISR);
-  timerAlarm(fanTimer, 1, true, 0);
-  timerStart(fanTimer);
-  fanSetPower(0);
+  // Pines de habilitación de drivers (arrancan deshabilitados)
+  pinMode(X_ENABLE_PIN, OUTPUT);
+  pinMode(Y_ENABLE_PIN, OUTPUT);
+  motorsEnable(false);
+
+  // LED de análisis PWM
+  pinMode(LED_ANALISIS_PIN, OUTPUT);
+  GPIO.out_w1tc = (1UL << LED_ANALISIS_PIN);
+  ledTimer = timerBegin(250000);   // 250 kHz -> ~976 Hz (256 niveles)
+  timerAttachInterrupt(ledTimer, ledTimerISR);
+  timerAlarm(ledTimer, 1, true, 0);
+  timerStart(ledTimer);
+  ledSetPower(0);
 
   // Steppers
   engine.init();
@@ -921,7 +975,7 @@ void setup() {
 
 /* ===================== LOOP ===================== */
 void loop() {
-  // SOLO IMPRIMIR TEMPERATURA FILTRADA CADA 1 s
+  // SOLO IMPRIMIR TEMPERATURA FILTRADA CADA 5 s
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 5000) {
     lastPrint = millis();
