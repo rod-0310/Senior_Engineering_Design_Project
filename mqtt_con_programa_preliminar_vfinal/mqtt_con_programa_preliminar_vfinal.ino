@@ -12,6 +12,38 @@
 #include "soc/gpio_struct.h"
 #include <math.h>
 
+// ================== MQTT / WiFi ==================
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ---- CONFIGURACIÓN WIFI ----
+const char* WIFI_SSID     = "Arqui";        // <- CAMBIA AQUÍ
+const char* WIFI_PASSWORD = "Ginger.1218";    // <- CAMBIA AQUÍ
+
+// --- Broker MQTT público (HiveMQ) ---
+#define MQTT_SERVER        "broker.hivemq.com"
+#define MQTT_PORT          1883
+
+// Prefijo de tópicos
+const char* MQTT_TOPIC_TEMP      = "hidrovida/temp";
+const char* MQTT_TOPIC_SETPOINT  = "hidrovida/setpoint";
+const char* MQTT_TOPIC_HEATER    = "hidrovida/heater";
+const char* MQTT_TOPIC_FAN       = "hidrovida/fan";
+const char* MQTT_TOPIC_PUMP      = "hidrovida/pump";
+const char* MQTT_TOPIC_POSX      = "hidrovida/posx";
+const char* MQTT_TOPIC_POSY      = "hidrovida/posy";
+const char* MQTT_TOPIC_SAFETY    = "hidrovida/safety";
+
+// Tópicos de comandos
+const char* MQTT_TOPIC_CMD_ANALISIS = "hidrovida/cmd/analisis";
+const char* MQTT_TOPIC_CMD_SP       = "hidrovida/cmd/sp";
+const char* MQTT_TOPIC_CMD_SAFE     = "hidrovida/cmd/safe";
+const char* MQTT_TOPIC_CMD_RAW      = "hidrovida/cmd/raw";
+
+// Cliente WiFi/MQTT
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
 /* ===================== HELPERS SALIDA (TODO POR Serial) ===================== */
 static inline void OUT_print(const String &s){ Serial.print(s); }
 static inline void OUT_print(const char* s) { Serial.print(s); }
@@ -26,14 +58,14 @@ static inline void OUT_println(const char* s) { Serial.println(s); }
 #define MAINS_FREQ_HZ        50
 static const uint32_t HALF_CYCLE_US = (1000000UL / (MAINS_FREQ_HZ * 2));
 
-double SETPOINT_C = 23.0;
+double SETPOINT_C = 22.0;
 const double SP_MIN = 0.0;
 const double SP_MAX = 80.0;
 
 // PID_v1 — Ts=0.1 s
-double Kp = 1.3450;
-double Ki = 1.0849;
-double Kd = 0.9846;
+double Kp = 2.0450;
+double Ki = 0.8149;
+double Kd = 1.4046;
 const uint16_t PID_SAMPLE_MS = 100;
 
 const double U_MIN = 25.0;   // 25 %
@@ -195,7 +227,7 @@ inline double clampSP(double sp){
  * ===================================================================== */
 
 static const float PX[6] = { 20.0f, 200.0f, 200.0f,  20.0f,  20.0f, 200.0f };
-static const float PY[6] = {  1.0f,   1.0f, 130.0f, 130.0f, 265.0f, 265.0f };
+static const float PY[6] = {  0.0f,   0.0f, 130.0f, 130.0f, 265.0f, 265.0f };
 
 // Ejes
 #define X_STEP_PIN     18
@@ -203,7 +235,7 @@ static const float PY[6] = {  1.0f,   1.0f, 130.0f, 130.0f, 265.0f, 265.0f };
 #define X_ENDSTOP_PIN  13
 #define X_ENDSTOP_ACTIVE_LOW 1
 
-#define Y_STEP_PIN     23 
+#define Y_STEP_PIN     23
 #define Y_DIR_PIN      16
 #define Y_ENDSTOP_PIN  32
 #define Y_ENDSTOP_ACTIVE_LOW 1
@@ -427,8 +459,10 @@ void ledSetPower(uint8_t p) {
 }
 
 /* ========================= BOMBA ========================= */
-inline void pumpOn()  { digitalWrite(PUMP_PIN, HIGH); }
-inline void pumpOff() { digitalWrite(PUMP_PIN, LOW);  }
+volatile bool pump_state = false;  // estado para MQTT
+
+inline void pumpOn()  { digitalWrite(PUMP_PIN, HIGH); pump_state = true;  }
+inline void pumpOff() { digitalWrite(PUMP_PIN, LOW);  pump_state = false; }
 
 /* ========================= HABILITACIÓN MOTORES ========================= */
 static void motorsEnable(bool on){
@@ -601,7 +635,8 @@ static QueueHandle_t qCmd;
 static TaskHandle_t hUI   = nullptr;
 static TaskHandle_t hUtil = nullptr;
 static TaskHandle_t hMotion = nullptr;
-static TaskHandle_t hAutoAnalisis = nullptr;   // tarea para análisis automático
+static TaskHandle_t hAutoAnalisis = nullptr;   // análisis automático
+static TaskHandle_t hMqtt = nullptr;           // tarea MQTT
 
 static String cmdBuf;
 
@@ -609,7 +644,7 @@ static String cmdBuf;
 static void setBusy(bool on){
   if (on) {
     if (motion_busy_depth == 0) {
-      motorsEnable(true);                 // habilita drivers (LOW en ENABLE)
+      motorsEnable(true);                 // habilita drivers
       xEventGroupSetBits(eg, EV_MOTION_BUSY);
     }
     motion_busy_depth++;
@@ -617,7 +652,7 @@ static void setBusy(bool on){
     if (motion_busy_depth > 0) {
       motion_busy_depth--;
       if (motion_busy_depth == 0) {
-        motorsEnable(false);             // deshabilita drivers al terminar todo movimiento
+        motorsEnable(false);             // deshabilita drivers
         xEventGroupClearBits(eg, EV_MOTION_BUSY);
       }
     }
@@ -699,7 +734,7 @@ static void handleStream(Stream& in, String& buf) {
 }
 
 static void vTaskUI(void*){
-  OUT_println("ESP32 listo. Usa 'help' para ver comandos (PID + MOTORES + LED).");
+  OUT_println("ESP32 listo. Usa 'help' para ver comandos (PID + MOTORES + LED + BOMBA).");
   for(;;){
     handleStream(Serial, cmdBuf);
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -764,8 +799,7 @@ static void doAnalisis(){
     snprintf(msg, sizeof(msg), "→ P%d = (%.1f, %.1f)", i+1, PX[i], PY[i]);
     OUT_println(msg);
 
-    // Bomba apagada mientras se mueve
-    pumpOff();
+    pumpOff();  // bomba apagada mientras se mueve
 
     if (!moveToXYAbsSync(PX[i], PY[i])){
       OUT_println("  ! Límite; Analisis abortado");
@@ -775,7 +809,7 @@ static void doAnalisis(){
 
     // Ya estamos en el punto: encender bomba
     pumpOn();
-    vTaskDelay(pdMS_TO_TICKS(2000));   // tiempo en cada punto con la bomba encendida
+    vTaskDelay(pdMS_TO_TICKS(2000));   // 2 s en cada punto
     pumpOff();
   }
 
@@ -784,7 +818,6 @@ static void doAnalisis(){
   (void)moveToXYAbsSync(0.0f, 0.0f);
   OUT_println("ANALISIS listo. Posición HOME (0,0).");
 
-  // Apagar LED, bomba y liberar busy (apaga motores)
   ledOff();
   pumpOff();
   setBusy(false);
@@ -811,14 +844,14 @@ static void vTaskMotion(void*){
           OUT_println("  kp <v>, ki <v>, kd <v>");
           OUT_println("  sp <v>, sp+ <d>, sp- <d>");
           OUT_println("  show, sens, safe on, safe off");
-          OUT_println("\nComandos MOTORES + LED:");
+          OUT_println("\nComandos MOTORES + LED + BOMBA:");
           OUT_println("  analisis");
           OUT_println("  p1..p6");
           OUT_println("  home | homex | homey");
           OUT_println("  g0   | g0x   | g0y");
           OUT_println("  mmx=<n> | mmy=<n>");
           OUT_println("  pos?");
-          OUT_println("  ledon | ledoff | led? | ledp=<0-255>\n");
+          OUT_println("  ledon | ledoff | led? | ledp=<0–255>\n");
           break;
 
         case CMD_LED_ON:     ledOn();  OUT_println("LED análisis ON"); break;
@@ -908,24 +941,137 @@ static void vTaskMotion(void*){
 }
 
 /* ========================= ANALISIS AUTOMÁTICO CADA 5 MIN ========================= */
-// 5 minutos para análisis automático
-const uint32_t ANALISIS_PERIOD_MS = 60UL * 60UL * 1000UL;//60 es una hora
+const uint32_t ANALISIS_PERIOD_MS = 60UL * 60UL * 1000UL;
 
 static void vTaskAutoAnalisis(void*){
   TickType_t last = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(ANALISIS_PERIOD_MS);
 
   for(;;){
-    // Espera periodo
     vTaskDelayUntil(&last, period);
 
-    // Espera a que no haya movimiento en curso
     while (xEventGroupGetBits(eg) & EV_MOTION_BUSY) {
-      vTaskDelay(pdMS_TO_TICKS(1000)); // reintenta cada 1 s
+      vTaskDelay(pdMS_TO_TICKS(1000)); // espera 1 s
     }
 
-    // Lanza análisis como si escribieras "analisis" por Serial
     uiSend(CMD_ANALISIS);
+  }
+}
+
+/* ========================= WIFI + MQTT ========================= */
+
+void setupWiFi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado.");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  msg.trim();
+
+  String t = String(topic);
+  Serial.print("MQTT mensaje en ");
+  Serial.print(t);
+  Serial.print(": ");
+  Serial.println(msg);
+
+  if (t == MQTT_TOPIC_CMD_ANALISIS) {
+    uiSend(CMD_ANALISIS);
+  }
+  else if (t == MQTT_TOPIC_CMD_SP) {
+    double sp = msg.toFloat();
+    uiSend(CMD_PID_SP_ABS, (float)sp);
+  }
+  else if (t == MQTT_TOPIC_CMD_SAFE) {
+    msg.toLowerCase();
+    if (msg == "on" || msg == "1" || msg == "true") {
+      uiSend(CMD_PID_SAFE_ON);
+    } else if (msg == "off" || msg == "0" || msg == "false") {
+      uiSend(CMD_PID_SAFE_OFF);
+    }
+  }
+  else if (t == MQTT_TOPIC_CMD_RAW) {
+    // Comando de texto como si fuera por Serial
+    parseLineAndDispatch(msg);
+  }
+}
+
+void reconnectMqtt() {
+  while (!mqttClient.connected()) {
+    Serial.print("Intentando conectar a MQTT...");
+    String clientId = "ESP32CNC-";
+    clientId += String(random(0xffff), HEX);
+
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println(" conectado.");
+      mqttClient.subscribe(MQTT_TOPIC_CMD_ANALISIS);
+      mqttClient.subscribe(MQTT_TOPIC_CMD_SP);
+      mqttClient.subscribe(MQTT_TOPIC_CMD_SAFE);
+      mqttClient.subscribe(MQTT_TOPIC_CMD_RAW);
+    } else {
+      Serial.print(" fallo, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" reintentando en 5s");
+      vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+  }
+}
+
+static void publishFloat(const char* topic, double value, uint8_t decimals = 2) {
+  char buf[32];
+  dtostrf(value, 0, decimals, buf);
+  mqttClient.publish(topic, buf, true);  // retained
+}
+
+static void publishBool(const char* topic, bool value) {
+  mqttClient.publish(topic, value ? "1" : "0", true);
+}
+
+static void vTaskMqtt(void* pv) {
+  (void)pv;
+  for (;;) {
+    if (!mqttClient.connected()) {
+      reconnectMqtt();
+    }
+    mqttClient.loop();
+
+    static uint32_t lastPub = 0;
+    uint32_t now = millis();
+    if (now - lastPub >= 2000) {  // cada 2 s
+      lastPub = now;
+
+      publishFloat(MQTT_TOPIC_TEMP,     y_tempC);
+      publishFloat(MQTT_TOPIC_SETPOINT, SETPOINT_C);
+      publishFloat(MQTT_TOPIC_HEATER,   u_duty);
+      publishFloat(MQTT_TOPIC_FAN,      fan_pct_last);
+      publishBool (MQTT_TOPIC_PUMP,     pump_state);
+      publishFloat(MQTT_TOPIC_POSX,     getXmm(), 2);
+      publishFloat(MQTT_TOPIC_POSY,     getYmm(), 2);
+
+      char safetyBuf[32];
+      snprintf(safetyBuf, sizeof(safetyBuf), "trip=%d,sens=%d",
+               safety_trip ? 1 : 0,
+               sensor_ok   ? 1 : 0);
+      mqttClient.publish(MQTT_TOPIC_SAFETY, safetyBuf, true);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -933,6 +1079,8 @@ static void vTaskAutoAnalisis(void*){
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  randomSeed(micros());   // para clientId MQTT aleatorio
 
   // ADC NTC
   analogReadResolution(12);
@@ -961,7 +1109,7 @@ void setup() {
   pinMode(X_ENDSTOP_PIN, INPUT_PULLUP);
   pinMode(Y_ENDSTOP_PIN, INPUT_PULLUP);
 
-  // Pines de habilitación de drivers (arrancan deshabilitados)
+  // Pines de habilitación de drivers
   pinMode(X_ENABLE_PIN, OUTPUT);
   pinMode(Y_ENABLE_PIN, OUTPUT);
   motorsEnable(false);
@@ -970,10 +1118,10 @@ void setup() {
   pinMode(PUMP_PIN, OUTPUT);
   pumpOff();
 
-  // LED de análisis PWM
+  // LED análisis PWM
   pinMode(LED_ANALISIS_PIN, OUTPUT);
   GPIO.out_w1tc = (1UL << LED_ANALISIS_PIN);
-  ledTimer = timerBegin(250000);   // 250 kHz -> ~976 Hz (256 niveles)
+  ledTimer = timerBegin(250000);   // 250 kHz
   timerAttachInterrupt(ledTimer, ledTimerISR);
   timerAlarm(ledTimer, 1, true, 0);
   timerStart(ledTimer);
@@ -1007,6 +1155,11 @@ void setup() {
   moveToXYAbsSync(0.0f, 0.0f);
   OUT_println("Posicionado en HOME (0,0).");
 
+  // ==== WIFI + MQTT ====
+  setupWiFi();
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
   // Tareas
   xTaskCreatePinnedToCore(taskSense,     "sense",   4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(taskControl,   "control", 4096, NULL, 3, NULL, 1);
@@ -1016,15 +1169,14 @@ void setup() {
   xTaskCreatePinnedToCore(vTaskUtil,     "UTIL",   2048, nullptr, 1, &hUtil,   0);
   xTaskCreatePinnedToCore(vTaskMotion,   "MOTION", 4096, nullptr, 3, &hMotion, 1);
 
-  // Nueva tarea: análisis automático cada 5 minutos
   xTaskCreatePinnedToCore(vTaskAutoAnalisis, "AUTO_ANAL", 4096, nullptr, 1, &hAutoAnalisis, 0);
+  xTaskCreatePinnedToCore(vTaskMqtt,         "MQTT",      4096, nullptr, 1, &hMqtt,         0);
 
-  OUT_println("Sistema listo. Usa 'help' en el Monitor Serie (115200).");
+  OUT_println("Sistema listo. Usa 'help' por Serial o manda comandos por MQTT (hidrovida/cmd/raw).");
 }
 
 /* ===================== LOOP ===================== */
 void loop() {
-  // SOLO IMPRIMIR TEMPERATURA FILTRADA CADA 5 s
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 5000) {
     lastPrint = millis();
